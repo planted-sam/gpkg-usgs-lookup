@@ -1,8 +1,0 @@
-{
-"type": "FeatureCollection",
-"name": "sample_site_bounds_polygon",
-"crs": { "type": "name", "properties": { "name": "urn:ogc:def:crs:OGC:1.3:CRS84" } },
-"features": [
-{ "type": "Feature", "properties": { "Name": "Terrain Bounds [Module zone]", "description": null, "timestamp": null, "begin": null, "end": null, "altitudeMode": null, "tessellate": -1, "extrude": 0, "visibility": -1, "drawOrder": null, "icon": null }, "geometry": { "type": "Polygon", "coordinates": [ [ [ -88.78162366197526, 39.186746513502705, 0.015551318414509 ], [ -88.781623849512059, 39.190864724154061, 0.006971574388444 ], [ -88.772450904447794, 39.190864616056956, 0.02169085573405 ], [ -88.772451252252196, 39.186746405421374, 0.030270602554083 ], [ -88.78162366197526, 39.186746513502705, 0.015551318414509 ] ] ] } }
-]
-}
