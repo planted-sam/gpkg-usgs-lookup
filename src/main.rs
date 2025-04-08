@@ -1,13 +1,13 @@
 use axum::Error;
-use axum::{Router, response::IntoResponse, routing::get, extract::Query};
+use axum::{Router, extract::Query, response::IntoResponse, routing::get};
 use futures::future::join_all;
 use gdal::{
     Dataset,
     vector::{Geometry, LayerAccess},
 };
 use quick_xml::{events::Event, reader::Reader};
-use std::path::Path;
 use serde::Deserialize;
+use std::path::Path;
 
 #[tokio::main]
 async fn main() {
@@ -42,7 +42,7 @@ async fn search_for_1m_usgs_product_urls(Query(params): Query<BboxParams>) -> im
             .await
             .expect("Failed to filter down complete set fo tifs to jsut overlapping ones.");
         println!("Overlapping ones: {:?}", only_overlapping_links);
-        return_str =format!("{:?}", only_overlapping_links);
+        return_str = format!("{:?}", only_overlapping_links);
     }
     return_str
 }
@@ -63,6 +63,11 @@ struct TIFBBox {
 
 // searches 1m metadata db for overlapping projects
 fn search_gpkg_dataset(bbox_wkt: &String) -> gdal::errors::Result<Vec<USGSProductResult>> {
+    // FYI: Got complaints from axum/tokio when making the `Geometry` struct in `search_for_1m_usgs_product_urls` instead of passing the WKT string
+    // The reason seemed to be that the C pointer the GDAL Geometry struct uses under the hood can't be shared safely across rust futures.
+    // Not a big issue, we can just make the Geometry here, but good to be aware of.
+    // Maybe there's potential perf boost in declaring a futures-safe geometry (see geozero crate?) and using that instead?
+    // (perf is probably more applicable for the overlapping check later...)
     let bbox = Geometry::from_wkt(bbox_wkt).unwrap();
     let mut output = vec![];
     let dataset = Dataset::open(Path::new("FESM_1m.gpkg")).unwrap();
@@ -134,6 +139,7 @@ async fn download_list_of_download_links(
         "About to fetch data for {:?} from {}\n(date: {},  metadata link: {})",
         usgs_result.name, usgs_result.product_link, usgs_result.date, usgs_result.metadata_link
     );
+    // each USGS product has a .txt file hosted that's just the direct links to each TIF file in the product, split by newlines
     let target = get_download_links_txt_file_url(&usgs_result.product_link);
     let response = reqwest::get(target).await?;
     let content = response
@@ -151,34 +157,47 @@ async fn download_list_of_download_links(
     Ok(links_arr)
 }
 
+// utilizing patterns in the StagedProducts directory structure to grab the urls for all the XML metadata fiels for each TIF
 fn get_xml_url_from_tif_url(tif_url: &String) -> String {
     tif_url
         .replace("/TIFF/", "/metadata/")
         .replace(".tif", ".xml")
 }
 
-async fn find_overlapping_files(tif_urls: &[String], input_bbox_wkt: &String) -> Result<Vec<String>, reqwest::Error> {
-    let tasks: Vec<_> = tif_urls.iter().map(|tif_url| {
-        let tif_url = tif_url.clone();
-        let bbox_wkt = input_bbox_wkt.clone();
+async fn find_overlapping_files(
+    tif_urls: &[String],
+    input_bbox_wkt: &String,
+) -> Result<Vec<String>, reqwest::Error> {
+    let tasks: Vec<_> = tif_urls
+        .iter()
+        .map(|tif_url| {
+            let tif_url = tif_url.clone();
+            let bbox_wkt = input_bbox_wkt.clone();
 
-        tokio::spawn(async move {
-            let xml_url = get_xml_url_from_tif_url(&tif_url);
-            let response = reqwest::get(xml_url).await.expect("Failed to fetch XML");
-            let xml_str = response.text().await.expect("Failed to parse XML");
+            tokio::spawn(async move {
+                let xml_url = get_xml_url_from_tif_url(&tif_url);
+                let response = reqwest::get(xml_url).await.expect("Failed to fetch XML");
+                let xml_str = response.text().await.expect("Failed to parse XML");
 
-            let bbox_info = parse_xml_for_bbox(&xml_str).unwrap();
+                let bbox_info = parse_xml_for_bbox(&xml_str).unwrap();
 
-            let tiff_bbox_geom = Geometry::bbox(bbox_info.westbc, bbox_info.southbc, bbox_info.eastbc, bbox_info.northbc).unwrap();
-            let input_bbox = Geometry::from_wkt(&bbox_wkt).unwrap();
+                let tiff_bbox_geom = Geometry::bbox(
+                    bbox_info.westbc,
+                    bbox_info.southbc,
+                    bbox_info.eastbc,
+                    bbox_info.northbc,
+                )
+                .unwrap();
+                let input_bbox = Geometry::from_wkt(&bbox_wkt).unwrap();
 
-            if tiff_bbox_geom.intersects(&input_bbox) {
-                Ok::<Option<String>, Error>(Some(tif_url))
-            } else {
-                Ok(None)
-            }
+                if tiff_bbox_geom.intersects(&input_bbox) {
+                    Ok::<Option<String>, Error>(Some(tif_url))
+                } else {
+                    Ok(None)
+                }
+            })
         })
-    }).collect();
+        .collect();
 
     let results = join_all(tasks).await;
     let mut overlapping_tif_urls = Vec::new();
@@ -196,9 +215,15 @@ async fn find_overlapping_files(tif_urls: &[String], input_bbox_wkt: &String) ->
     Ok(overlapping_tif_urls)
 }
 
+// each USGS metadata XML has a set of tags in it for describing the bounding box of the particular TIF
 fn parse_xml_for_bbox(xml_str: &str) -> Result<TIFBBox, Box<dyn std::error::Error>> {
     let mut reader = Reader::from_str(xml_str);
-    let mut bbox_info = TIFBBox { westbc: 0.0, eastbc: 0.0, northbc: 0.0, southbc: 0.0 };
+    let mut bbox_info = TIFBBox {
+        westbc: 0.0,
+        eastbc: 0.0,
+        northbc: 0.0,
+        southbc: 0.0,
+    };
     let mut tag = None;
     loop {
         match reader.read_event()? {
