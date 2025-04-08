@@ -1,3 +1,5 @@
+use axum::Error;
+use axum::{Router, response::IntoResponse, routing::get, extract::Query};
 use futures::future::join_all;
 use gdal::{
     Dataset,
@@ -5,8 +7,46 @@ use gdal::{
 };
 use quick_xml::{events::Event, reader::Reader};
 use std::path::Path;
+use serde::Deserialize;
 
-#[derive(Debug)]
+#[tokio::main]
+async fn main() {
+    let app = Router::new()
+        .route("/", get(health_check))
+        .route("/1m-product-urls", get(search_for_1m_usgs_product_urls));
+    let listener = tokio::net::TcpListener::bind("0.0.0.0:8080").await.unwrap();
+    axum::serve(listener, app).await.unwrap();
+}
+
+async fn health_check() -> impl IntoResponse {
+    "OK"
+}
+
+#[derive(Deserialize)]
+struct BboxParams {
+    bbox: String,
+}
+
+async fn search_for_1m_usgs_product_urls(Query(params): Query<BboxParams>) -> impl IntoResponse {
+    println!("bbox wkt: {}", params.bbox);
+    let results = search_gpkg_dataset(&params.bbox).unwrap();
+    let mut return_str = String::new();
+    if results.len() > 0 {
+        // only check first result for now - TODO: pick most recent
+        let download_links = download_list_of_download_links(&results[0])
+            .await
+            .expect("Failed to fetch download links for requested bbox.");
+        println!("Successfully grabbed list of TIF's, checking to find overlap...");
+
+        let only_overlapping_links = find_overlapping_files(&download_links, &params.bbox)
+            .await
+            .expect("Failed to filter down complete set fo tifs to jsut overlapping ones.");
+        println!("Overlapping ones: {:?}", only_overlapping_links);
+        return_str =format!("{:?}", only_overlapping_links);
+    }
+    return_str
+}
+
 struct USGSProductResult {
     pub product_link: String,
     pub metadata_link: String,
@@ -14,7 +54,6 @@ struct USGSProductResult {
     pub name: String,
 }
 
-#[derive(Debug)]
 struct TIFBBox {
     westbc: f64,
     eastbc: f64,
@@ -23,7 +62,8 @@ struct TIFBBox {
 }
 
 // searches 1m metadata db for overlapping projects
-fn search_gpkg_dataset(bbox: &Geometry) -> gdal::errors::Result<Vec<USGSProductResult>> {
+fn search_gpkg_dataset(bbox_wkt: &String) -> gdal::errors::Result<Vec<USGSProductResult>> {
+    let bbox = Geometry::from_wkt(bbox_wkt).unwrap();
     let mut output = vec![];
     let dataset = Dataset::open(Path::new("FESM_1m.gpkg")).unwrap();
     for mut layer in dataset.layers() {
@@ -117,107 +157,72 @@ fn get_xml_url_from_tif_url(tif_url: &String) -> String {
         .replace(".tif", ".xml")
 }
 
-// Used to filter down our list of downlaod files to just ones that matter for our qeuried area
-async fn find_overlapping_files(
-    tif_urls: &[String],
-    input_bbox: &Geometry,
-) -> Result<Vec<String>, reqwest::Error> {
-    let mut tasks = Vec::new();
-    // convert geom to WKT (string format essentially) because we can't share a Geometry between futures
-    let input_bbox_wkt = input_bbox.wkt().unwrap();
-    for tif_url in tif_urls.iter() {
-        let input_bbox_wkt = input_bbox_wkt.clone();
+async fn find_overlapping_files(tif_urls: &[String], input_bbox_wkt: &String) -> Result<Vec<String>, reqwest::Error> {
+    let tasks: Vec<_> = tif_urls.iter().map(|tif_url| {
         let tif_url = tif_url.clone();
-        // Spawn a new async task for each TIF URL
-        let task = tokio::spawn(async move {
+        let bbox_wkt = input_bbox_wkt.clone();
+
+        tokio::spawn(async move {
             let xml_url = get_xml_url_from_tif_url(&tif_url);
-            let response = reqwest::get(xml_url)
-                .await
-                .expect("Failed to fetch XML metadata");
-            let xml_str = response.text().await.expect("Failed to parse XML metadata");
+            let response = reqwest::get(xml_url).await.expect("Failed to fetch XML");
+            let xml_str = response.text().await.expect("Failed to parse XML");
 
-            let mut reader = Reader::from_str(&xml_str);
-            let mut bbox_info = TIFBBox {
-                westbc: 0.0,
-                eastbc: 0.0,
-                northbc: 0.0,
-                southbc: 0.0,
-            };
+            let bbox_info = parse_xml_for_bbox(&xml_str).unwrap();
 
-            let mut tag = None;
-            loop {
-                match reader.read_event() {
-                    Ok(Event::Start(ref e)) => match e.name().0 {
-                        b"westbc" => tag = Some("westbc"),
-                        b"eastbc" => tag = Some("eastbc"),
-                        b"northbc" => tag = Some("northbc"),
-                        b"southbc" => tag = Some("southbc"),
-                        _ => tag = None,
-                    },
-                    Ok(Event::Text(e)) => {
-                        if let Some(ref t) = tag {
-                            let value = e.unescape().unwrap().into_owned().parse::<f64>().unwrap();
-                            match *t {
-                                "westbc" => bbox_info.westbc = value,
-                                "eastbc" => bbox_info.eastbc = value,
-                                "northbc" => bbox_info.northbc = value,
-                                "southbc" => bbox_info.southbc = value,
-                                _ => (),
-                            }
-                        }
-                    }
-                    Ok(Event::End(_)) => tag = None,
-                    Ok(Event::Eof) => break,
-                    Err(e) => panic!("Error at position {}: {:?}", reader.buffer_position(), e),
-                    _ => (),
-                }
-            }
+            let tiff_bbox_geom = Geometry::bbox(bbox_info.westbc, bbox_info.southbc, bbox_info.eastbc, bbox_info.northbc).unwrap();
+            let input_bbox = Geometry::from_wkt(&bbox_wkt).unwrap();
 
-            let tiff_bbox_geom = Geometry::bbox(
-                bbox_info.westbc,
-                bbox_info.southbc,
-                bbox_info.eastbc,
-                bbox_info.northbc,
-            )
-            .unwrap();
-            let input_bbox = Geometry::from_wkt(input_bbox_wkt.as_str()).unwrap();
             if tiff_bbox_geom.intersects(&input_bbox) {
-                Some(tif_url)
+                Ok::<Option<String>, Error>(Some(tif_url))
             } else {
-                None
+                Ok(None)
             }
-        });
+        })
+    }).collect();
 
-        tasks.push(task);
-    }
-
-    // Wait for all tasks to complete
     let results = join_all(tasks).await;
     let mut overlapping_tif_urls = Vec::new();
 
     for result in results {
-        if let Ok(Some(url)) = result {
-            overlapping_tif_urls.push(url);
+        match result {
+            Ok(inner_result) => match inner_result.expect("Failed to process TIF URL") {
+                Some(url) => overlapping_tif_urls.push(url),
+                None => {}
+            },
+            Err(_) => {}
         }
     }
 
     Ok(overlapping_tif_urls)
 }
 
-#[tokio::main]
-async fn main() {
-    // test bbox of cheeseman park of denver
-    let bbox = Geometry::bbox(-104.968487, 39.729283, -104.964238, 39.736420).unwrap();
-    let results = search_gpkg_dataset(&bbox).unwrap();
-    if results.len() > 0 {
-        // only check first result for now - TODO: pick most recent
-        let download_links = download_list_of_download_links(&results[0])
-            .await
-            .expect("Failed to fetch download links for requested bbox.");
-        println!("Successfully grabbed list of TIF's, checking to find overlap...");
-        let only_overlapping_links = find_overlapping_files(&download_links, &bbox)
-            .await
-            .expect("Failed to filter down complete set fo tifs to jsut overlapping ones.");
-        println!("Overlapping ones: {:?}", only_overlapping_links);
+fn parse_xml_for_bbox(xml_str: &str) -> Result<TIFBBox, Box<dyn std::error::Error>> {
+    let mut reader = Reader::from_str(xml_str);
+    let mut bbox_info = TIFBBox { westbc: 0.0, eastbc: 0.0, northbc: 0.0, southbc: 0.0 };
+    let mut tag = None;
+    loop {
+        match reader.read_event()? {
+            Event::Start(ref e) => match e.name().0 {
+                b"westbc" => tag = Some("westbc"),
+                b"eastbc" => tag = Some("eastbc"),
+                b"northbc" => tag = Some("northbc"),
+                b"southbc" => tag = Some("southbc"),
+                _ => tag = None,
+            },
+            Event::Text(e) if tag.is_some() => {
+                let value: f64 = e.unescape()?.parse()?;
+                match tag.unwrap() {
+                    "westbc" => bbox_info.westbc = value,
+                    "eastbc" => bbox_info.eastbc = value,
+                    "northbc" => bbox_info.northbc = value,
+                    "southbc" => bbox_info.southbc = value,
+                    _ => (),
+                }
+            }
+            Event::End(_) => tag = None,
+            Event::Eof => break,
+            _ => (),
+        }
     }
+    Ok(bbox_info)
 }
