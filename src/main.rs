@@ -119,7 +119,7 @@ fn get_xml_url_from_tif_url(tif_url: &String) -> String {
 
 // Used to filter down our list of downlaod files to just ones that matter for our qeuried area
 async fn find_overlapping_files(
-    tif_urls: &[String], 
+    tif_urls: &[String],
     input_bbox: &Geometry,
 ) -> Result<Vec<String>, reqwest::Error> {
     let mut tasks = Vec::new();
@@ -206,7 +206,7 @@ async fn find_overlapping_files(
 
 #[tokio::main]
 async fn main() {
-    // test bbox of cheeseman park
+    // test bbox of cheeseman park of denver
     let bbox = Geometry::bbox(-104.968487, 39.729283, -104.964238, 39.736420).unwrap();
     let results = search_gpkg_dataset(&bbox).unwrap();
     if results.len() > 0 {
