@@ -1,11 +1,9 @@
-use axum::Error;
 use axum::{Router, extract::Query, response::IntoResponse, routing::get};
-use futures::future::join_all;
 use gdal::{
     Dataset,
     vector::{Geometry, LayerAccess},
 };
-use quick_xml::{events::Event, reader::Reader};
+use proj::Proj;
 use serde::Deserialize;
 use std::path::Path;
 
@@ -38,9 +36,7 @@ async fn search_for_1m_usgs_product_urls(Query(params): Query<BboxParams>) -> im
             .expect("Failed to fetch download links for requested bbox.");
         println!("Successfully grabbed list of TIF's, checking to find overlap...");
 
-        let only_overlapping_links = find_overlapping_files(&download_links, &params.bbox)
-            .await
-            .expect("Failed to filter down complete set fo tifs to jsut overlapping ones.");
+        let only_overlapping_links = find_overlapping_files(&download_links, &params.bbox);
         println!("Overlapping ones: {:?}", only_overlapping_links);
         return_str = format!("{:?}", only_overlapping_links);
     }
@@ -54,61 +50,33 @@ struct USGSProductResult {
     pub name: String,
 }
 
-struct TIFBBox {
-    westbc: f64,
-    eastbc: f64,
-    northbc: f64,
-    southbc: f64,
-}
-
 // searches 1m metadata db for overlapping projects
 fn search_gpkg_dataset(bbox_wkt: &String) -> gdal::errors::Result<Vec<USGSProductResult>> {
-    // FYI: Got complaints from axum/tokio when making the `Geometry` struct in `search_for_1m_usgs_product_urls` instead of passing the WKT string
-    // The reason seemed to be that the C pointer the GDAL Geometry struct uses under the hood can't be shared safely across rust futures.
-    // Not a big issue, we can just make the Geometry here, but good to be aware of.
-    // Maybe there's potential perf boost in declaring a futures-safe geometry (see geozero crate?) and using that instead?
-    // (perf is probably more applicable for the overlapping check later...)
     let bbox = Geometry::from_wkt(bbox_wkt).unwrap();
     let mut output = vec![];
     let dataset = Dataset::open(Path::new("FESM_1m.gpkg")).unwrap();
     for mut layer in dataset.layers() {
+        // filter down to jsut what matches our provided bbox
+        layer.set_spatial_filter(&bbox);
         for feature in layer.features() {
-            let feature_geom = feature.geometry();
-            match feature_geom {
-                Some(outer_geom) => {
-                    let inner_geom_count = outer_geom.geometry_count();
-                    if inner_geom_count > 0 {
-                        for inner_geom_idx in 0..inner_geom_count {
-                            let inner_geom = outer_geom.get_geometry(inner_geom_idx);
-                            if inner_geom.intersects(&bbox) {
-                                output.push(USGSProductResult {
-                                    product_link: feature
-                                        .field_as_string(
-                                            feature.field_index("product_link").unwrap(),
-                                        )
-                                        .unwrap()
-                                        .unwrap(),
-                                    metadata_link: feature
-                                        .field_as_string(
-                                            feature.field_index("metadata_link").unwrap(),
-                                        )
-                                        .unwrap()
-                                        .unwrap(),
-                                    date: feature
-                                        .field_as_string(feature.field_index("pub_date").unwrap())
-                                        .unwrap()
-                                        .unwrap(),
-                                    name: feature
-                                        .field_as_string(feature.field_index("project").unwrap())
-                                        .unwrap()
-                                        .unwrap(),
-                                })
-                            }
-                        }
-                    }
-                }
-                None => {}
-            }
+            output.push(USGSProductResult {
+                product_link: feature
+                    .field_as_string(feature.field_index("product_link").unwrap())
+                    .unwrap()
+                    .unwrap(),
+                metadata_link: feature
+                    .field_as_string(feature.field_index("metadata_link").unwrap())
+                    .unwrap()
+                    .unwrap(),
+                date: feature
+                    .field_as_string(feature.field_index("pub_date").unwrap())
+                    .unwrap()
+                    .unwrap(),
+                name: feature
+                    .field_as_string(feature.field_index("project").unwrap())
+                    .unwrap()
+                    .unwrap(),
+            });
         }
     }
 
@@ -157,97 +125,62 @@ async fn download_list_of_download_links(
     Ok(links_arr)
 }
 
-// utilizing patterns in the StagedProducts directory structure to grab the urls for all the XML metadata fiels for each TIF
-fn get_xml_url_from_tif_url(tif_url: &String) -> String {
-    tif_url
-        .replace("/TIFF/", "/metadata/")
-        .replace(".tif", ".xml")
+fn extract_coords_from_url(url: &str) -> Option<(f64, f64)> {
+    let re = regex::Regex::new(r"x(\d+)y(\d+)").ok()?;
+    let caps = re.captures(url)?;
+
+    let x: f64 = caps.get(1)?.as_str().parse().ok()?;
+    let y_raw: f64 = caps.get(2)?.as_str().parse().ok()?;
+    // scale up Y value, it's provided with one decimal precision (X just has int precision)
+    let y = y_raw / 10.0;
+
+    Some((x, y))
 }
 
-async fn find_overlapping_files(
-    tif_urls: &[String],
-    input_bbox_wkt: &String,
-) -> Result<Vec<String>, reqwest::Error> {
-    let tasks: Vec<_> = tif_urls
-        .iter()
-        .map(|tif_url| {
-            let tif_url = tif_url.clone();
-            let bbox_wkt = input_bbox_wkt.clone();
+fn lonlat_to_utm(lon: f64, lat: f64) -> Option<(f64, f64, u8)> {
+    let zone = ((lon + 180.0) / 6.0).floor() as u8 + 1;
+    let epsg_code = if lat >= 0.0 {
+        32600 + zone as u32 // Northern Hemisphere
+    } else {
+        32700 + zone as u32 // Southern Hemisphere
+    };
+    let to_utm = Proj::new_known_crs("EPSG:4326", &format!("EPSG:{}", epsg_code), None).ok()?;
+    let (x, y) = to_utm.convert((lon, lat)).ok()?;
+    Some((x, y, zone))
+}
 
-            tokio::spawn(async move {
-                let xml_url = get_xml_url_from_tif_url(&tif_url);
-                let response = reqwest::get(xml_url).await.expect("Failed to fetch XML");
-                let xml_str = response.text().await.expect("Failed to parse XML");
+fn find_overlapping_files(tif_urls: &[String], input_bbox_wkt: &String) -> Vec<String> {
+    // grab input bbox
+    let bbox_wkt = input_bbox_wkt.clone();
+    let input_bbox_geom = Geometry::from_wkt(&bbox_wkt).unwrap();
+    // get it's actual bbox (in case someone passed a non bbox polygon in)
+    let input_bbox_envelope = input_bbox_geom.envelope();
+    // convert bbox points to UTM (TIF urls have coords in UTM values)
+    let min_coord_utm = lonlat_to_utm(input_bbox_envelope.MinX, input_bbox_envelope.MinY).unwrap();
+    let max_coord_utm = lonlat_to_utm(input_bbox_envelope.MaxX, input_bbox_envelope.MaxY).unwrap();
+    // scale UTM coordinates to match TIF URL format
+    let scaled_min_x = min_coord_utm.0 / 10000.0;
+    let scaled_max_x = max_coord_utm.0 / 10000.0;
+    let scaled_min_y = min_coord_utm.1 / 100000.0;
+    let scaled_max_y = max_coord_utm.1 / 100000.0;
 
-                let bbox_info = parse_xml_for_bbox(&xml_str).unwrap();
-
-                let tiff_bbox_geom = Geometry::bbox(
-                    bbox_info.westbc,
-                    bbox_info.southbc,
-                    bbox_info.eastbc,
-                    bbox_info.northbc,
-                )
-                .unwrap();
-                let input_bbox = Geometry::from_wkt(&bbox_wkt).unwrap();
-
-                if tiff_bbox_geom.intersects(&input_bbox) {
-                    Ok::<Option<String>, Error>(Some(tif_url))
-                } else {
-                    Ok(None)
-                }
-            })
-        })
-        .collect();
-
-    let results = join_all(tasks).await;
     let mut overlapping_tif_urls = Vec::new();
 
-    for result in results {
-        match result {
-            Ok(inner_result) => match inner_result.expect("Failed to process TIF URL") {
-                Some(url) => overlapping_tif_urls.push(url),
-                None => {}
-            },
-            Err(_) => {}
+    for tif_url in tif_urls {
+        let coords_from_url =
+            extract_coords_from_url(&tif_url).expect("Failed to extract coordinates from TIF URL");
+        let tile_min_x = coords_from_url.0;
+        let tile_min_y = coords_from_url.1;
+        let tile_max_x = tile_min_x + 1.0;
+        let tile_max_y = tile_min_y + 0.1;
+
+        let overlap_in_x = scaled_min_x <= tile_max_x && scaled_max_x >= tile_min_x;
+        let overlap_in_y = scaled_min_y <= tile_max_y && scaled_max_y >= tile_min_y;
+
+        if overlap_in_x && overlap_in_y {
+            overlapping_tif_urls.push(tif_url.clone());
         }
     }
 
-    Ok(overlapping_tif_urls)
-}
-
-// each USGS metadata XML has a set of tags in it for describing the bounding box of the particular TIF
-fn parse_xml_for_bbox(xml_str: &str) -> Result<TIFBBox, Box<dyn std::error::Error>> {
-    let mut reader = Reader::from_str(xml_str);
-    let mut bbox_info = TIFBBox {
-        westbc: 0.0,
-        eastbc: 0.0,
-        northbc: 0.0,
-        southbc: 0.0,
-    };
-    let mut tag = None;
-    loop {
-        match reader.read_event()? {
-            Event::Start(ref e) => match e.name().0 {
-                b"westbc" => tag = Some("westbc"),
-                b"eastbc" => tag = Some("eastbc"),
-                b"northbc" => tag = Some("northbc"),
-                b"southbc" => tag = Some("southbc"),
-                _ => tag = None,
-            },
-            Event::Text(e) if tag.is_some() => {
-                let value: f64 = e.unescape()?.parse()?;
-                match tag.unwrap() {
-                    "westbc" => bbox_info.westbc = value,
-                    "eastbc" => bbox_info.eastbc = value,
-                    "northbc" => bbox_info.northbc = value,
-                    "southbc" => bbox_info.southbc = value,
-                    _ => (),
-                }
-            }
-            Event::End(_) => tag = None,
-            Event::Eof => break,
-            _ => (),
-        }
-    }
-    Ok(bbox_info)
+    overlapping_tif_urls
 }
