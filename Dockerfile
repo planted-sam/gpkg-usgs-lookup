@@ -5,7 +5,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 # make sure cargo is in the path so we can build
 ENV PATH="/root/.cargo/bin:${PATH}"    
 # bonus helper packages
-RUN apt update && \apt install -y build-essential libssl-dev git pkg-config libclang-dev
+RUN apt update && \apt install -y build-essential libssl-dev git pkg-config libclang-dev libproj-dev
 
 WORKDIR /usr/src/app
 COPY . .
