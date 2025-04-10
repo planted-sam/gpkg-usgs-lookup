@@ -6,10 +6,13 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 ENV PATH="/root/.cargo/bin:${PATH}"    
 # bonus helper packages
 RUN apt update && \apt install -y build-essential libssl-dev git pkg-config libclang-dev libproj-dev
-
+# env setup done, prepare app code for build
 WORKDIR /usr/src/app
+# download the .gpkg file for 1m resolution USGS products (~1.2GB give it a sec)
+RUN curl -L -o FESM_1m.gpkg https://prd-tnm.s3.amazonaws.com/StagedProducts/Elevation/1m/FullExtentSpatialMetadata/FESM_1m.gpkg
+# copy app code
 COPY . .
-# Build with specific library paths and verbose output
+# build
 RUN RUSTFLAGS="-L /usr/lib -L /lib" cargo build --release
-
+# run it!
 CMD ["/usr/src/app/target/release/gpkg-usgs-lookup"]

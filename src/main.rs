@@ -170,9 +170,9 @@ fn find_overlapping_files(tif_urls: &[String], input_bbox_wkt: &String) -> Vec<S
         let coords_from_url =
             extract_coords_from_url(&tif_url).expect("Failed to extract coordinates from TIF URL");
         let tile_min_x = coords_from_url.0;
-        let tile_min_y = coords_from_url.1;
+        let tile_min_y = coords_from_url.1 - 0.1;
         let tile_max_x = tile_min_x + 1.0;
-        let tile_max_y = tile_min_y + 0.1;
+        let tile_max_y = coords_from_url.1;
 
         let overlap_in_x = scaled_min_x <= tile_max_x && scaled_max_x >= tile_min_x;
         let overlap_in_y = scaled_min_y <= tile_max_y && scaled_max_y >= tile_min_y;
